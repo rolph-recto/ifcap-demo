@@ -4,23 +4,6 @@ import z3
 
 ## AST
 
-### Type
-class IntType:
-  def __init__(self):
-    pass
-
-  def __eq__(self, other):
-    return isinstance(other, IntType)
-
-class RefType:
-  def __init__(self, cell_type, label):
-    self.cell_type = cell_type
-    self.label = label
-
-  def __eq__(self, other):
-    return isinstance(other, RefType) and self.cell_type == other.cell_type
-
-
 ### Statements
 
 class Declare:
@@ -91,7 +74,26 @@ class Deref:
   def __init__(self, ref):
     self.ref = ref
 
-### solver
+
+## Type
+
+class IntType:
+  def __init__(self):
+    pass
+
+  def __eq__(self, other):
+    return isinstance(other, IntType)
+
+class RefType:
+  def __init__(self, cell_type, label):
+    self.cell_type = cell_type
+    self.label = label
+
+  def __eq__(self, other):
+    return isinstance(other, RefType) and self.cell_type == other.cell_type
+
+
+## Solver
 
 class TypeChecker:
   def __init__(self):
