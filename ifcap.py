@@ -123,6 +123,9 @@ class TypeChecker:
 
     return self.solver.check()
 
+
+  ## constraints
+
   # c1 forks off c2 and c3
   # c1 <= c2 \meet c3
   def constr_fork(self, c1, c2, c3):
@@ -170,6 +173,30 @@ class TypeChecker:
     self.solver.add(z3.Exists([x], v(x)))
 
 
+  ## type and context unification
+
+  def unify_types(self, t1, t2):
+    if isinstance(t1, IntType) and isinstance(t2, IntType):
+      return IntType()
+
+    elif isinstance(t1, RefType) and isinstance(t2, RefType):
+      unified_cell_type = self.unify_types(t1.cell_type, t2.cell_type)
+      unified_ref_label = self.new_ref_label()
+      self.constr_control_join(t1.label, t2.label, unified_ref_label)
+      return RefType(unified_cell_type, unified_ref_label)
+
+  def unify_contexts(self, ctx1, ctx2):
+    unified_ctx = dict()
+
+    for key in ctx1:
+      if key in ctx2:
+        unified_ctx[key] = self.unify_types(ctx1[key], ctx2[key])
+
+    return unified_ctx
+
+
+  ## the actual type checking algorithm!!
+
   def _checkExpr(self, type_ctx, pc, expr):
     if isinstance(expr, Read):
       return type_ctx[expr.var]
@@ -199,6 +226,18 @@ class TypeChecker:
 
       return IntType()
 
+  def update_type(self, ctx, var, new_type):
+    if isinstance(var, Read):
+      new_ctx = dict(ctx)
+      new_ctx[var.var] = new_type
+      return new_ctx
+
+    elif isinstance(var, Deref):
+      return self.update_type(ctx, var.ref, new_type)
+
+    else:
+      raise Exception("cannot update type of lval " + str(var))
+
   def _check(self, type_ctx, proc_ctx, pc, prog):
     if isinstance(prog, Declare):
       init_type = self._checkExpr(type_ctx, pc, prog.init_val)
@@ -213,8 +252,10 @@ class TypeChecker:
       assert(isinstance(var_type, RefType) and isinstance(rhs_type, RefType))
       assert(var_type.cell_type == rhs_type.cell_type)
 
-      self.constr_alias(var_type.label, rhs_type.label)
-      return type_ctx, proc_ctx, pc
+      # self.constr_alias(var_type.label, rhs_type.label)
+      out_type_ctx = self.update_type(type_ctx, prog.var, rhs_type)
+
+      return out_type_ctx, proc_ctx, pc
 
     elif isinstance(prog, Write):
       var_type = self._checkExpr(type_ctx, pc, prog.var)
@@ -237,7 +278,7 @@ class TypeChecker:
           self._check(type_ctx, proc_ctx, spawn_pc, prog.spawned_prog)
 
       out_proc_ctx = dict(sout_proc_ctx)
-      out_proc_ctx[prog.handle] = sout_pc
+      out_proc_ctx[prog.handle] = (sout_type_ctx, sout_pc)
 
       return type_ctx, out_proc_ctx, cont_pc
 
@@ -245,11 +286,14 @@ class TypeChecker:
       if prog.handle not in proc_ctx:
         raise ("no existing process handle: " + prog.handle)
 
-      fork_pc = proc_ctx[prog.handle]
-      out_pc = self.new_pc()
+      fork_type_ctx, fork_pc = proc_ctx[prog.handle]
 
+      out_pc = self.new_pc()
       self.constr_join(fork_pc, pc, out_pc)
-      return type_ctx, proc_ctx, out_pc
+
+      out_type_ctx = self.unify_contexts(type_ctx, fork_type_ctx)
+
+      return out_type_ctx, proc_ctx, out_pc
 
     elif isinstance(prog, Cond):
       self._checkExpr(type_ctx, pc, prog.guard)
@@ -260,23 +304,28 @@ class TypeChecker:
       eout_type_ctx, eout_proc_ctx, eout_pc = \
           self._check(type_ctx, proc_ctx, pc, prog.elseBranch)
 
+      out_type_ctx = self.unify_contexts(tout_type_ctx, eout_type_ctx)
+
       out_pc = self.new_pc()
       self.constr_control_join(tout_pc, eout_pc, out_pc)
 
       assert(tout_proc_ctx == eout_proc_ctx)
 
-      return type_ctx, tout_proc_ctx, out_pc
+      return out_type_ctx, tout_proc_ctx, out_pc
 
     elif isinstance(prog, While):
       self._checkExpr(type_ctx, pc, prog.guard)
       bout_type_ctx, bout_proc_ctx, bout_pc = \
           self._check(type_ctx, dict(), pc, prog.body)
 
+      out_type_ctx = self.unify_contexts(type_ctx, bout_type_ctx)
+
       assert(bout_proc_ctx == dict())
 
       out_pc = self.new_pc()
       self.constr_control_join(pc, bout_pc, out_pc)
-      return type_ctx, proc_ctx, out_pc
+
+      return out_type_ctx, proc_ctx, out_pc
 
     elif isinstance(prog, Block):
       cur_type_ctx = type_ctx
@@ -320,8 +369,62 @@ def prog2():
       Write(Read("x"), Literal(2))
     ])
 
+
+# no races because we re-point y before writing to it in forked process!
+def prog3():
+  return \
+    Block([ \
+      Declare("x", NewRef(Literal(0))), \
+      Declare("y", NewRef(Literal(0))), \
+      Assign(Read("y"), Read("x")),
+      Fork("f", Block([ \
+        Assign(Read("y"), NewRef(Literal(0))),
+        Write(Read("y"), Literal(0))
+      ])), \
+      Write(Read("x"), Literal(1)), \
+      Join("f"), \
+      Write(Read("x"), Literal(2))
+    ])
+
+# write-write race because of aliasing, with a branch
+def prog4():
+  return \
+    Block([ \
+      Declare("x", NewRef(Literal(0))), \
+      Declare("y", NewRef(Literal(0))), \
+      Assign(Read("y"), Read("x")),
+      Fork("f", Block([ \
+        Cond(Literal(0), \
+          Write(Read("y"), Literal(0)), \
+          Block([]) \
+        )
+      ])), \
+      Write(Read("x"), Literal(1)), \
+      Join("f"), \
+      Write(Read("x"), Literal(2))
+    ])
+
+# no races (concurrent reads)
+def prog5():
+  return \
+    Block([ \
+      Declare("x", NewRef(Literal(0))), \
+      Declare("y", NewRef(Literal(0))), \
+      Declare("z", NewRef(Literal(0))), \
+      Fork("f", Block([ \
+        Write(Read("y"), Deref(Read("x")))
+      ])), \
+      Write(Read("z"), Deref(Read("x"))),
+      Join("f"), \
+      Write(Read("x"), Literal(2))
+    ])
+
+
 def main():
   checker = TypeChecker()
   print(checker.check(prog1()))
   print(checker.check(prog2()))
+  print(checker.check(prog3()))
+  print(checker.check(prog4()))
+  print(checker.check(prog5()))
 
