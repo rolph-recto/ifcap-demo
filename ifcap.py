@@ -11,11 +11,17 @@ class Declare:
     self.var = var
     self.init_val = init_val
 
+  def __str__(self):
+    return str(self.var) + " := " + str(self.init_val)
+
 # alias one ref to another
 class Assign:
   def __init__(self, var, rhs):
     self.var = var
     self.rhs = rhs
+
+  def __str__(self):
+    return str(self.var) + " := " + str(self.rhs)
 
 # write into a ref's contents
 class Write:
@@ -23,14 +29,23 @@ class Write:
     self.var = var
     self.rhs = rhs
 
+  def __str__(self):
+    return str(self.var) + " := " + str(self.rhs)
+
 class Fork:
   def __init__(self, handle, prog):
     self.handle = handle
     self.spawned_prog = prog
 
+  def __str__(self):
+    return self.handle + " <- fork { ... }"
+
 class Join:
   def __init__(self, handle):
     self.handle = handle
+
+  def __str__(self):
+    return "join " + self.handle
 
 class Cond:
   def __init__(self, guard, thenBranch, elseBranch):
@@ -38,10 +53,16 @@ class Cond:
     self.thenBranch = thenBranch
     self.elseBranch = elseBranch
 
+  def __str__(self):
+    return "if (" + str(self.guard) + ") { ... } else { ... }"
+
 class While:
   def __init__(self, guard, body):
     self.guard
     self.body = body
+
+  def __str__(self):
+    return "while (" + str(self.guard) + ") { ... }"
 
 class Block:
   def __init__(self, stmts):
@@ -50,6 +71,8 @@ class Block:
   def add(self, stmt):
     self.statements.append(stmt)
 
+  def __str__(self):
+    return "\n".join(map(lambda s: str(s), self.statements))
 
 ### Expressions
 
@@ -57,23 +80,37 @@ class Read:
   def __init__(self, var):
     self.var = var
 
+  def __str__(self):
+    return self.var
+
 class Literal:
   def __init__(self, v):
     self.value = v
+
+  def __str__(self):
+    return str(self.value)
 
 class Binop:
   def __init__(self, lhs, rhs):
     self.lhs = lhs
     self.rhs = rhs
 
+  def __str__(self):
+    return str(self.lhs) + " * " + str(self.rhs)
+
 class NewRef:
   def __init__(self, val):
     self.val = val
+
+  def __str__(self):
+    return "newref(" + str(self.val) + ")"
 
 class Deref:
   def __init__(self, ref):
     self.ref = ref
 
+  def __str__(self):
+    return "!" + str(self.ref)
 
 ## Type
 
@@ -110,15 +147,22 @@ class RefType:
 class TypeChecker:
   def __init__(self):
     self.solver = z3.Solver()
+    self.reset()
+
+  def reset(self):
     self.pc_count = 1
     self.ref_count = 1
+    self.assert_count = 1
+    self.assert_map = dict()
+    self.program_map = dict()
+    self.solver.reset()
 
   def new_label(self, name):
     return z3.Function(name, z3.IntSort(), z3.BoolSort())
 
-  def new_ref_label(self):
+  def new_ref_label(self, prog):
     label = self.new_label(("ref" + str(self.ref_count)))
-    self.constr_nonempty(label)
+    self.constr_nonempty(label, prog)
     self.ref_count += 1
     return label
 
@@ -128,93 +172,107 @@ class TypeChecker:
     return pc
 
   def check(self, prog):
-    self.pc_count = 0
-    self.solver.reset()
+    self.reset()
 
     out_type_ctx, out_proc_ctx, out_pc = \
         self._check(dict(), dict(), self.new_pc(), prog)
 
-    return self.solver.check() == z3.sat
+    result = self.solver.check()
+    unsat_core = self.solver.unsat_core()
+
+    unsat_core_map = dict()
+    for assert_name in self.assert_map:
+      if z3.Bool(assert_name) in unsat_core:
+        unsat_core_map[assert_name] = \
+            (self.assert_map[assert_name], self.program_map[assert_name])
+
+    return result == z3.sat, unsat_core_map
 
 
   ## constraints
+  def add_assert(self, prop, prog):
+    assert_name = "assert" + str(self.assert_count)
+    self.assert_count += 1
+
+    self.solver.assert_and_track(prop, assert_name)
+    self.assert_map[assert_name] = prop
+    self.program_map[assert_name] = prog
 
   # c1 forks off c2 and c3
   # c1 <= c2 \meet c3
-  def constr_fork(self, c1, c2, c3):
+  def constr_fork(self, c1, c2, c3, prog):
     x = z3.Int("x")
-    self.solver.add(z3.ForAll([x], z3.Implies(z3.Or(c2(x), c3(x)), c1(x))))
+    self.add_assert(z3.ForAll([x], z3.Implies(z3.Or(c2(x), c3(x)), c1(x))), prog)
 
   # c1 and c2 join to c3
   # c1 \meet c3 <= c3
-  def constr_join(self, c1, c2, c3):
+  def constr_join(self, c1, c2, c3, prog):
     x = z3.Int("x")
-    self.solver.add(z3.ForAll([x], z3.Implies(c3(x), z3.Or(c1(x), c2(x)))))
+    self.add_assert(z3.ForAll([x], z3.Implies(c3(x), z3.Or(c1(x), c2(x)))), prog)
 
   # pc1 and pc2 have a control point join at pc3
   # pc1 \join pc2 <= p3
-  def constr_control_join(self, pc1, pc2, pc3):
+  def constr_control_join(self, pc1, pc2, pc3, prog):
     x = z3.Int("x")
-    self.solver.add(z3.ForAll([x], z3.Implies(pc3(x), z3.And(pc1(x), pc2(x)))))
+    self.add_assert(z3.ForAll([x], z3.Implies(pc3(x), z3.And(pc1(x), pc2(x)))), prog)
 
   # two regions are disjoint
-  def constr_disjoint(self, r1, r2):
+  def constr_disjoint(self, r1, r2, prog):
     x = z3.Int("x")
-    self.solver.add(z3.ForAll([x], z3.Not(z3.And(r1(x), r2(x)))))
+    self.add_assert(z3.ForAll([x], z3.Not(z3.And(r1(x), r2(x)))), prog)
 
   # ref r1 is aliased to ref r2
   # r1 <= r2
-  def constr_alias(self, r1, r2):
+  def constr_alias(self, r1, r2, prog):
     x = z3.Int("x")
-    self.solver.add(z3.ForAll([x], z3.Implies(r2(x), r1(x))))
+    self.add_assert(z3.ForAll([x], z3.Implies(r2(x), r1(x))), prog)
 
   # process p writes to v
   # p <= v
-  def constr_write(self, p, v):
+  def constr_write(self, p, v, prog):
     x = z3.Int("x")
-    self.solver.add(z3.ForAll([x], z3.Implies(v(x), p(x))))
+    self.add_assert(z3.ForAll([x], z3.Implies(v(x), p(x))), prog)
 
   # process p reads from v
   # p \join v != top
-  def constr_read(self, p, v):
+  def constr_read(self, p, v, prog):
     x = z3.Int("x")
-    self.solver.add(z3.Exists([x], z3.And(p(x), v(x))))
+    self.add_assert(z3.Exists([x], z3.And(p(x), v(x))), prog)
 
   # data region v is not empty
-  def constr_nonempty(self, v):
+  def constr_nonempty(self, v, prog):
     x = z3.Int("x")
-    self.solver.add(z3.Exists([x], v(x)))
+    self.add_assert(z3.Exists([x], v(x)), prog)
 
 
   ## type and context unification
 
-  def unify_types(self, t1, t2, is_control_join=True):
+  def unify_types(self, t1, t2, prog):
     if isinstance(t1, IntType) and isinstance(t2, IntType):
       return IntType()
 
     elif isinstance(t1, RefType) and isinstance(t2, RefType):
       if t1.label is not t2.label:
-        unified_cell_type = self.unify_types(t1.cell_type, t2.cell_type)
-        unified_ref_label = self.new_ref_label()
+        unified_cell_type = self.unify_types(t1.cell_type, t2.cell_type, prog)
+        unified_ref_label = self.new_ref_label(prog)
 
-        if is_control_join:
-          self.constr_control_join(t1.label, t2.label, unified_ref_label)
-
-        else:
-          self.constr_join(t1.label, t2.label, unified_ref_label)
+        self.constr_control_join(t1.label, t2.label, unified_ref_label, prog)
 
         return RefType(unified_cell_type, unified_ref_label)
 
       else:
         return t1
 
-  def unify_contexts(self, ctx1, ctx2, is_control_join=True):
+    else:
+      raise Exception("cannot unify types: " + str(t1) + " and " + str(t2))
+
+  def unify_contexts(self, ctx1, ctx2, prog):
     unified_ctx = dict()
 
     for key in ctx1:
       if key in ctx2:
         unified_ctx[key] = \
-            self.unify_types(ctx1[key], ctx2[key], is_control_join)
+            self.unify_types(ctx1[key], ctx2[key], prog)
 
     return unified_ctx
 
@@ -230,14 +288,14 @@ class TypeChecker:
 
     elif isinstance(expr, NewRef):
       cell_type = self._checkExpr(type_ctx, pc, expr.val)
-      label = self.new_ref_label()
+      label = self.new_ref_label(expr)
       return RefType(cell_type, label)
 
     elif isinstance(expr, Deref):
       ref_type = self._checkExpr(type_ctx, pc, expr.ref)
 
       assert(isinstance(ref_type, RefType))
-      self.constr_read(pc, ref_type.label)
+      self.constr_read(pc, ref_type.label, expr)
 
       return ref_type.cell_type
 
@@ -296,15 +354,15 @@ class TypeChecker:
       assert(isinstance(var_type, RefType))
       assert(type(var_type.cell_type) == type(rhs_type))
 
-      self.constr_write(pc, var_type.label)
+      self.constr_write(pc, var_type.label, prog)
       return type_ctx, proc_ctx, pc
 
     elif isinstance(prog, Fork):
       spawn_pc = self.new_pc()
       cont_pc = self.new_pc()
 
-      self.constr_fork(pc, cont_pc, spawn_pc)
-      self.constr_disjoint(cont_pc, spawn_pc)
+      self.constr_fork(pc, cont_pc, spawn_pc, prog)
+      self.constr_disjoint(cont_pc, spawn_pc, prog)
 
       sout_type_ctx, sout_proc_ctx, sout_pc = \
           self._check(type_ctx, proc_ctx, spawn_pc, prog.spawned_prog)
@@ -321,12 +379,9 @@ class TypeChecker:
       spawn_type_ctx, spawn_pc = proc_ctx[prog.handle]
 
       out_pc = self.new_pc()
-      self.constr_join(spawn_pc, pc, out_pc)
+      self.constr_join(spawn_pc, pc, out_pc, prog)
 
-      out_type_ctx = \
-          self.unify_contexts(type_ctx, spawn_type_ctx, is_control_join=False)
-
-      return out_type_ctx, proc_ctx, out_pc
+      return type_ctx, proc_ctx, out_pc
 
     elif isinstance(prog, Cond):
       self._checkExpr(type_ctx, pc, prog.guard)
@@ -337,10 +392,10 @@ class TypeChecker:
       eout_type_ctx, eout_proc_ctx, eout_pc = \
           self._check(type_ctx, proc_ctx, pc, prog.elseBranch)
 
-      out_type_ctx = self.unify_contexts(tout_type_ctx, eout_type_ctx)
+      out_type_ctx = self.unify_contexts(tout_type_ctx, eout_type_ctx, prog)
 
       out_pc = self.new_pc()
-      self.constr_control_join(tout_pc, eout_pc, out_pc)
+      self.constr_control_join(tout_pc, eout_pc, out_pc, prog)
 
       assert(tout_proc_ctx == eout_proc_ctx)
 
@@ -351,12 +406,12 @@ class TypeChecker:
       bout_type_ctx, bout_proc_ctx, bout_pc = \
           self._check(type_ctx, dict(), pc, prog.body)
 
-      out_type_ctx = self.unify_contexts(type_ctx, bout_type_ctx)
+      out_type_ctx = self.unify_contexts(type_ctx, bout_type_ctx, prog)
 
       assert(bout_proc_ctx == dict())
 
       out_pc = self.new_pc()
-      self.constr_control_join(pc, bout_pc, out_pc)
+      self.constr_control_join(pc, bout_pc, out_pc, prog)
 
       return out_type_ctx, proc_ctx, out_pc
 
@@ -592,24 +647,47 @@ prog10 = \
 
 # write-write race, re-point inside a conditional
 prog11 = \
-  Block([ \
-    Declare("x", NewRef(Literal(0))), \
-    Declare("y", NewRef(Literal(0))), \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("y", NewRef(Literal(0))),
     Assign(Read("y"), Read("x")),
-    Fork("f", Block([ \
+    Fork("f", Block([
       Cond(Literal(0),
         Assign(Read("y"), NewRef(Literal(0))),
         Block([]),
       ),
       Write(Read("y"), Literal(0))
-    ])), \
-    Write(Read("x"), Literal(1)), \
-    Join("f"), \
+    ])),
+    Write(Read("x"), Literal(1)),
+    Join("f"),
     Write(Read("x"), Literal(2))
   ])
 
+
+# no races, even though all writes are to x!
+prog12 = \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("y", NewRef(Literal(0))),
+    Declare("z", NewRef(Literal(0))),
+    Fork("p", Block([
+      Assign(Read("x"), Read("y")),
+      Fork("q", Block([
+        Assign(Read("x"), Read("z")),
+        Write(Read("x"), Literal(1))
+      ])),
+      Write(Read("x"), Literal(2)),
+      Join("q"),
+      Write(Read("x"), Literal(3))
+    ])),
+    Write(Read("x"), Literal(1)),
+    Join("p"),
+    Write(Read("x"), Literal(2))
+  ])
+
+
 def print_check(checker, name, prog, has_races):
-  result = checker.check(prog)
+  result, unsat_core = checker.check(prog)
   if result != has_races:
     print("test " + name + " failed!")
 
@@ -622,9 +700,18 @@ def print_check(checker, name, prog, has_races):
     print("")
     print(print_stmt(prog))
     print("")
+    print("unsat core:")
+    for assert_name, (prop, prog) in unsat_core.items():
+      print(assert_name +  ": " + str(prop))
+      print("generated by program location: ")
+      print(str(prog))
+      print("")
+
+    print("")
 
   else:
     print("test " + name + " passed!")
+
 
 
 def main():
@@ -641,4 +728,5 @@ def main():
   print_check(checker, "prog9", prog9, False)
   print_check(checker, "prog10", prog10, False)
   print_check(checker, "prog11", prog11, False)
+  print_check(checker, "prog12", prog12, True)
 
