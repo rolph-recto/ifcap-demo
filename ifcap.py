@@ -84,6 +84,12 @@ class IntType:
   def __eq__(self, other):
     return isinstance(other, IntType)
 
+  def __str__(self):
+    return "int"
+
+  def __repr__(self):
+    return self.__str__()
+
 class RefType:
   def __init__(self, cell_type, label):
     self.cell_type = cell_type
@@ -91,6 +97,12 @@ class RefType:
 
   def __eq__(self, other):
     return isinstance(other, RefType) and self.cell_type == other.cell_type
+
+  def __str__(self):
+    return "(" + str(self.cell_type) + ") ref"
+
+  def __repr__(self):
+    return self.__str__()
 
 
 ## Solver
@@ -121,7 +133,7 @@ class TypeChecker:
     out_type_ctx, out_proc_ctx, out_pc = \
         self._check(dict(), dict(), self.new_pc(), prog)
 
-    return self.solver.check()
+    return self.solver.check() == z3.sat
 
 
   ## constraints
@@ -180,10 +192,14 @@ class TypeChecker:
       return IntType()
 
     elif isinstance(t1, RefType) and isinstance(t2, RefType):
-      unified_cell_type = self.unify_types(t1.cell_type, t2.cell_type)
-      unified_ref_label = self.new_ref_label()
-      self.constr_control_join(t1.label, t2.label, unified_ref_label)
-      return RefType(unified_cell_type, unified_ref_label)
+      if t1.label is not t2.label:
+        unified_cell_type = self.unify_types(t1.cell_type, t2.cell_type)
+        unified_ref_label = self.new_ref_label()
+        self.constr_control_join(t1.label, t2.label, unified_ref_label)
+        return RefType(unified_cell_type, unified_ref_label)
+
+      else:
+        return t1
 
   def unify_contexts(self, ctx1, ctx2):
     unified_ctx = dict()
@@ -226,17 +242,23 @@ class TypeChecker:
 
       return IntType()
 
-  def update_type(self, ctx, var, new_type):
+  def update_type(self, var, old_type, new_type):
     if isinstance(var, Read):
-      new_ctx = dict(ctx)
-      new_ctx[var.var] = new_type
-      return new_ctx
+      return new_type
 
-    elif isinstance(var, Deref):
-      return self.update_type(ctx, var.ref, new_type)
+    elif isinstance(var, Deref) and isinstance(old_type, RefType):
+      new_cell_type = self.update_type(var.ref, old_type.cell_type, new_type)
+      return RefType(new_cell_type, old_type.label)
 
     else:
       raise Exception("cannot update type of lval " + str(var))
+
+  def get_lval_var(self, lval):
+    if isinstance(lval, Read):
+      return lval.var
+
+    elif isinstance(lval, Deref):
+      return self.get_lval_var(lval.ref)
 
   def _check(self, type_ctx, proc_ctx, pc, prog):
     if isinstance(prog, Declare):
@@ -253,7 +275,10 @@ class TypeChecker:
       assert(var_type.cell_type == rhs_type.cell_type)
 
       # self.constr_alias(var_type.label, rhs_type.label)
-      out_type_ctx = self.update_type(type_ctx, prog.var, rhs_type)
+      lval_var = self.get_lval_var(prog.var)
+      new_type = self.update_type(prog.var, type_ctx[lval_var], rhs_type)
+      out_type_ctx = dict(type_ctx)
+      out_type_ctx[lval_var] = new_type
 
       return out_type_ctx, proc_ctx, pc
 
@@ -286,12 +311,12 @@ class TypeChecker:
       if prog.handle not in proc_ctx:
         raise ("no existing process handle: " + prog.handle)
 
-      fork_type_ctx, fork_pc = proc_ctx[prog.handle]
+      spawn_type_ctx, spawn_pc = proc_ctx[prog.handle]
 
       out_pc = self.new_pc()
-      self.constr_join(fork_pc, pc, out_pc)
+      self.constr_join(spawn_pc, pc, out_pc)
 
-      out_type_ctx = self.unify_contexts(type_ctx, fork_type_ctx)
+      out_type_ctx = self.unify_contexts(type_ctx, spawn_type_ctx)
 
       return out_type_ctx, proc_ctx, out_pc
 
@@ -339,92 +364,203 @@ class TypeChecker:
       return cur_type_ctx, cur_proc_ctx, cur_pc
 
 
+def print_expr(expr):
+  if isinstance(expr, Read):
+    return expr.var
+
+  elif isinstance(expr, Literal):
+    return str(expr.value)
+
+  elif isinstance(expr, Binop):
+    return print_expr(expr.lhs) + " * " + print_expr(expr.rhs)
+
+  elif isinstance(expr, NewRef):
+    return "newref(" + print_expr(expr.val) + ")"
+
+  elif isinstance(expr, Deref):
+    return "!" + print_expr(expr.ref)
+
+def print_stmt(prog, indent_level=0):
+  indent = " " * indent_level
+
+  if isinstance(prog, Declare):
+    return indent + prog.var + " := " + print_expr(prog.init_val)
+
+  elif isinstance(prog, Assign):
+    return indent + print_expr(prog.var) + " = " + print_expr(prog.rhs)
+
+  elif isinstance(prog, Write):
+    return indent + print_expr(prog.var) + " := " + print_expr(prog.rhs)
+
+  elif isinstance(prog, Fork):
+    return indent + prog.handle + " <- fork {\n" + \
+        print_stmt(prog.spawned_prog, indent_level+2) + "\n" + indent + "}"
+
+  elif isinstance(prog, Join):
+    return indent + "join " + prog.handle
+
+  elif isinstance(prog, Cond):
+    return indent + "if (" + print_expr(prog.guard) + ") {\n" + \
+        print_stmt(prog.thenBranch, indent_level+2) + "\n" + indent + \
+        "} else {\n" + \
+        print_stmt(prog.elseBranch, indent_level+2) + indent + "}"
+
+  elif isinstance(prog, While):
+    return indent + "while (" + print_expr(prog.guard) + ") {\n" + \
+        print_stmt(prog.body, indent_level+2) + "\n" + indent + "}"
+
+  elif isinstance(prog, Block):
+    block_str_list = []
+
+    for stmt in prog.statements:
+      block_str_list.append(print_stmt(stmt, indent_level))
+
+    return "\n".join(block_str_list)
+
+
 # write-read race
-def prog1():
-  return \
-    Block([ \
-      Declare("x", NewRef(Literal(0))), \
-      Declare("y", NewRef(Literal(0))), \
-      Fork("f", Block([ \
-        Write(Read("y"), Deref(Read("x")))
-      ])), \
-      Write(Read("x"), Literal(1)), \
-      Join("f"), \
-      Write(Read("x"), Literal(2))
-    ])
+prog1 = \
+  Block([ \
+    Declare("x", NewRef(Literal(0))), \
+    Declare("y", NewRef(Literal(0))), \
+    Fork("f", Block([ \
+      Write(Read("y"), Deref(Read("x")))
+    ])), \
+    Write(Read("x"), Literal(1)), \
+    Join("f"), \
+    Write(Read("x"), Literal(2))
+  ])
 
 
 # write-write race because of aliasing
-def prog2():
-  return \
-    Block([ \
-      Declare("x", NewRef(Literal(0))), \
-      Declare("y", NewRef(Literal(0))), \
-      Assign(Read("y"), Read("x")),
-      Fork("f", Block([ \
-        Write(Read("y"), Literal(0))
-      ])), \
-      Write(Read("x"), Literal(1)), \
-      Join("f"), \
-      Write(Read("x"), Literal(2))
-    ])
+prog2 = \
+  Block([ \
+    Declare("x", NewRef(Literal(0))), \
+    Declare("y", NewRef(Literal(0))), \
+    Assign(Read("y"), Read("x")),
+    Fork("f", Block([ \
+      Write(Read("y"), Literal(0))
+    ])), \
+    Write(Read("x"), Literal(1)), \
+    Join("f"), \
+    Write(Read("x"), Literal(2))
+  ])
 
 
 # no races because we re-point y before writing to it in forked process!
-def prog3():
-  return \
-    Block([ \
-      Declare("x", NewRef(Literal(0))), \
-      Declare("y", NewRef(Literal(0))), \
-      Assign(Read("y"), Read("x")),
-      Fork("f", Block([ \
-        Assign(Read("y"), NewRef(Literal(0))),
-        Write(Read("y"), Literal(0))
-      ])), \
-      Write(Read("x"), Literal(1)), \
-      Join("f"), \
-      Write(Read("x"), Literal(2))
-    ])
+prog3 = \
+  Block([ \
+    Declare("x", NewRef(Literal(0))), \
+    Declare("y", NewRef(Literal(0))), \
+    Assign(Read("y"), Read("x")),
+    Fork("f", Block([ \
+      Assign(Read("y"), NewRef(Literal(0))),
+      Write(Read("y"), Literal(0))
+    ])), \
+    Write(Read("x"), Literal(1)), \
+    Join("f"), \
+    Write(Read("x"), Literal(2))
+  ])
 
 # write-write race because of aliasing, with a branch
-def prog4():
-  return \
-    Block([ \
-      Declare("x", NewRef(Literal(0))), \
-      Declare("y", NewRef(Literal(0))), \
-      Assign(Read("y"), Read("x")),
-      Fork("f", Block([ \
-        Cond(Literal(0), \
-          Write(Read("y"), Literal(0)), \
-          Block([]) \
-        )
-      ])), \
-      Write(Read("x"), Literal(1)), \
-      Join("f"), \
-      Write(Read("x"), Literal(2))
-    ])
+prog4 = \
+  Block([ \
+    Declare("x", NewRef(Literal(0))), \
+    Declare("y", NewRef(Literal(0))), \
+    Assign(Read("y"), Read("x")),
+    Fork("f", Block([ \
+      Cond(Literal(0), \
+        Write(Read("y"), Literal(0)), \
+        Block([]) \
+      )
+    ])), \
+    Write(Read("x"), Literal(1)), \
+    Join("f"), \
+    Write(Read("x"), Literal(2))
+  ])
 
 # no races (concurrent reads)
-def prog5():
-  return \
-    Block([ \
-      Declare("x", NewRef(Literal(0))), \
-      Declare("y", NewRef(Literal(0))), \
-      Declare("z", NewRef(Literal(0))), \
-      Fork("f", Block([ \
-        Write(Read("y"), Deref(Read("x")))
-      ])), \
-      Write(Read("z"), Deref(Read("x"))),
-      Join("f"), \
-      Write(Read("x"), Literal(2))
-    ])
+prog5 = \
+  Block([ \
+    Declare("x", NewRef(Literal(0))), \
+    Declare("y", NewRef(Literal(0))), \
+    Declare("z", NewRef(Literal(0))), \
+    Fork("f", Block([ \
+      Write(Read("y"), Deref(Read("x")))
+    ])), \
+    Write(Read("z"), Deref(Read("x"))),
+    Join("f"), \
+    Write(Read("x"), Literal(2))
+  ])
 
+# write-write race with nested refs
+prog6 = \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("y", NewRef(NewRef(Literal(0)))),
+    Assign(Deref(Read("y")), Read("x")),
+    Fork("f", Block([
+      Cond(Literal(0),
+        Write(Deref(Read("y")), Literal(0)),
+        Block([])
+      )
+    ])),
+    Write(Read("x"), Literal(1)),
+    Join("f"),
+    Write(Read("x"), Literal(2))
+  ])
+
+
+## write-write race, multiple processes and conditionals
+prog7 = \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("y", NewRef(Literal(0))),
+    Assign(Read("y"), Read("x")),
+    Fork("f", Block([
+      Cond(Literal(0),
+        Write(Read("y"), Literal(0)),
+        Block([])
+      )
+    ])),
+    Fork("q", Block([
+      Write(Read("x"), Literal(1))
+    ])),
+    Join("f"),
+    Join("q")
+  ])
+
+
+## write-write race, multiple processes
+prog8 = \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("y", NewRef(Literal(0))),
+    Assign(Read("y"), Read("x")),
+    Fork("f", Block([])),
+    Fork("q", Block([
+      Write(Read("x"), Literal(1))
+    ])),
+    Join("f"),
+    Write(Read("x"), Literal(2)),
+    Join("q")
+  ])
+
+
+def print_check(checker, prog):
+  print("")
+  print(print_stmt(prog))
+  print("race-free!" if checker.check(prog) else "has races!")
 
 def main():
   checker = TypeChecker()
-  print(checker.check(prog1()))
-  print(checker.check(prog2()))
-  print(checker.check(prog3()))
-  print(checker.check(prog4()))
-  print(checker.check(prog5()))
+
+  print_check(checker, prog1)
+  print_check(checker, prog2)
+  print_check(checker, prog3)
+  print_check(checker, prog4)
+  print_check(checker, prog5)
+  print_check(checker, prog6)
+  print_check(checker, prog7)
+  print_check(checker, prog8)
 
