@@ -118,6 +118,7 @@ class TypeChecker:
 
   def new_ref_label(self):
     label = self.new_label(("ref" + str(self.ref_count)))
+    self.constr_nonempty(label)
     self.ref_count += 1
     return label
 
@@ -223,7 +224,6 @@ class TypeChecker:
     elif isinstance(expr, NewRef):
       cell_type = self._checkExpr(type_ctx, pc, expr.val)
       label = self.new_ref_label()
-      self.constr_nonempty(label)
       return RefType(cell_type, label)
 
     elif isinstance(expr, Deref):
@@ -274,7 +274,7 @@ class TypeChecker:
       assert(isinstance(var_type, RefType) and isinstance(rhs_type, RefType))
       assert(var_type.cell_type == rhs_type.cell_type)
 
-      # self.constr_alias(var_type.label, rhs_type.label)
+      # self.constr_alias(rhs_type.label, var_type.label)
       lval_var = self.get_lval_var(prog.var)
       new_type = self.update_type(prog.var, type_ctx[lval_var], rhs_type)
       out_type_ctx = dict(type_ctx)
@@ -403,7 +403,7 @@ def print_stmt(prog, indent_level=0):
     return indent + "if (" + print_expr(prog.guard) + ") {\n" + \
         print_stmt(prog.thenBranch, indent_level+2) + "\n" + indent + \
         "} else {\n" + \
-        print_stmt(prog.elseBranch, indent_level+2) + indent + "}"
+        print_stmt(prog.elseBranch, indent_level+2) + "\n" + indent + "}"
 
   elif isinstance(prog, While):
     return indent + "while (" + print_expr(prog.guard) + ") {\n" + \
@@ -565,6 +565,41 @@ prog9 = \
   ])
 
 
+# write-write race, re-point inside a conditional
+prog10 = \
+  Block([ \
+    Declare("x", NewRef(Literal(0))), \
+    Declare("y", NewRef(Literal(0))), \
+    Assign(Read("y"), Read("x")),
+    Fork("f", Block([ \
+      Cond(Literal(0),
+        Assign(Read("y"), NewRef(Literal(0))),
+        Write(Read("y"), Literal(0))
+      )
+    ])), \
+    Write(Read("x"), Literal(1)), \
+    Join("f"), \
+    Write(Read("x"), Literal(2))
+  ])
+
+# write-write race, re-point inside a conditional
+prog11 = \
+  Block([ \
+    Declare("x", NewRef(Literal(0))), \
+    Declare("y", NewRef(Literal(0))), \
+    Assign(Read("y"), Read("x")),
+    Fork("f", Block([ \
+      Cond(Literal(0),
+        Assign(Read("y"), NewRef(Literal(0))),
+        Block([]),
+      ),
+      Write(Read("y"), Literal(0))
+    ])), \
+    Write(Read("x"), Literal(1)), \
+    Join("f"), \
+    Write(Read("x"), Literal(2))
+  ])
+
 def print_check(checker, prog):
   print("")
   print(print_stmt(prog))
@@ -582,4 +617,6 @@ def main():
   print_check(checker, prog7)
   print_check(checker, prog8)
   print_check(checker, prog9)
+  print_check(checker, prog10)
+  print_check(checker, prog11)
 
