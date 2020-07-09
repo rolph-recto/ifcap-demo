@@ -4,12 +4,38 @@ import z3
 
 ## AST
 
-### Statements
-class Declare:
-  def __init__(self, var):
-    self.var = var
+### Type
+class IntType:
+  def __init__(self):
+    pass
 
+  def __eq__(self, other):
+    return isinstance(other, IntType)
+
+class RefType:
+  def __init__(self, cell_type, label):
+    self.cell_type = cell_type
+    self.label = label
+
+  def __eq__(self, other):
+    return isinstance(other, RefType) and self.cell_type == other.cell_type
+
+
+### Statements
+
+class Declare:
+  def __init__(self, var, init_val):
+    self.var = var
+    self.init_val = init_val
+
+# alias one ref to another
 class Assign:
+  def __init__(self, var, rhs):
+    self.var = var
+    self.rhs = rhs
+
+# write into a ref's contents
+class Write:
   def __init__(self, var, rhs):
     self.var = var
     self.rhs = rhs
@@ -44,7 +70,7 @@ class Block:
 
 ### Expressions
 
-class VarRead:
+class Read:
   def __init__(self, var):
     self.var = var
 
@@ -57,22 +83,32 @@ class Binop:
     self.lhs = lhs
     self.rhs = rhs
 
+class NewRef:
+  def __init__(self, val):
+    self.val = val
+
+class Deref:
+  def __init__(self, ref):
+    self.ref = ref
 
 ### solver
-
-TYPE_EXPR = 0
-TYPE_STMT = 1
 
 class TypeChecker:
   def __init__(self):
     self.solver = z3.Solver()
-    self.pc_count = 0
+    self.pc_count = 1
+    self.ref_count = 1
 
   def new_label(self, name):
     return z3.Function(name, z3.IntSort(), z3.BoolSort())
 
+  def new_ref_label(self):
+    label = self.new_label(("ref" + str(self.ref_count)))
+    self.ref_count += 1
+    return label
+
   def new_pc(self):
-    pc = self.new_label("pc" + str(self.pc_count))
+    pc = self.new_label(("pc" + str(self.pc_count)))
     self.pc_count += 1
     return pc
 
@@ -89,12 +125,7 @@ class TypeChecker:
   # c1 <= c2 \meet c3
   def constr_fork(self, c1, c2, c3):
     x = z3.Int("x")
-    self.solver.add(\
-        z3.ForAll([x], \
-        z3.Implies( \
-          z3.Or(c2(x), c3(x)), \
-          c1(x))))
-
+    self.solver.add(z3.ForAll([x], z3.Implies(z3.Or(c2(x), c3(x)), c1(x))))
 
   # c1 and c2 join to c3
   # c1 \meet c3 <= c3
@@ -102,19 +133,22 @@ class TypeChecker:
     x = z3.Int("x")
     self.solver.add(z3.ForAll([x], z3.Implies(c3(x), z3.Or(c1(x), c2(x)))))
 
-
   # pc1 and pc2 have a control point join at pc3
   # pc1 \join pc2 <= p3
   def constr_control_join(self, pc1, pc2, pc3):
     x = z3.Int("x")
     self.solver.add(z3.ForAll([x], z3.Implies(pc3(x), z3.And(pc1(x), pc2(x)))))
 
-
   # two regions are disjoint
   def constr_disjoint(self, r1, r2):
     x = z3.Int("x")
     self.solver.add(z3.ForAll([x], z3.Not(z3.And(r1(x), r2(x)))))
 
+  # ref r1 is aliased to ref r2
+  # r1 <= r2
+  def constr_alias(self, r1, r2):
+    x = z3.Int("x")
+    self.solver.add(z3.ForAll([x], z3.Implies(r2(x), r1(x))))
 
   # process p writes to v
   # p <= v
@@ -122,13 +156,11 @@ class TypeChecker:
     x = z3.Int("x")
     self.solver.add(z3.ForAll([x], z3.Implies(v(x), p(x))))
 
-
   # process p reads from v
   # p \join v != top
   def constr_read(self, p, v):
     x = z3.Int("x")
     self.solver.add(z3.Exists([x], z3.And(p(x), v(x))))
-
 
   # data region v is not empty
   def constr_nonempty(self, v):
@@ -137,28 +169,59 @@ class TypeChecker:
 
 
   def _checkExpr(self, type_ctx, pc, expr):
-    if isinstance(expr, VarRead):
-      self.constr_read(pc, type_ctx[expr.var])
+    if isinstance(expr, Read):
+      return type_ctx[expr.var]
 
     elif isinstance(expr, Literal):
-      pass
+      return IntType()
+
+    elif isinstance(expr, NewRef):
+      cell_type = self._checkExpr(type_ctx, pc, expr.val)
+      label = self.new_ref_label()
+      self.constr_nonempty(label)
+      return RefType(cell_type, label)
+
+    elif isinstance(expr, Deref):
+      ref_type = self._checkExpr(type_ctx, pc, expr.ref)
+
+      assert(isinstance(ref_type, RefType))
+      self.constr_read(pc, ref_type.label)
+
+      return ref_type.cell_type
 
     elif isinstance(expr, Binop):
-      self._checkExpr(type_ctx, pc, expr.lhs)
-      self._checkExpr(type_ctx, pc, expr.rhs)
+      lhs_type = self._checkExpr(type_ctx, pc, expr.lhs)
+      rhs_type = self._checkExpr(type_ctx, pc, expr.rhs)
+
+      assert(isinstance(lhs_type, IntType) and isinstance(rhs_type, IntType))
+
+      return IntType()
 
   def _check(self, type_ctx, proc_ctx, pc, prog):
     if isinstance(prog, Declare):
-      label = self.new_label(prog.var)
-      self.constr_nonempty(label)
-
+      init_type = self._checkExpr(type_ctx, pc, prog.init_val)
       out_type_ctx = dict(type_ctx)
-      out_type_ctx[prog.var] = label
+      out_type_ctx[prog.var] = init_type
       return out_type_ctx, proc_ctx, pc
 
     elif isinstance(prog, Assign):
-      self._checkExpr(type_ctx, pc, prog.rhs)
-      self.constr_write(pc, type_ctx[prog.var])
+      var_type = self._checkExpr(type_ctx, pc, prog.var)
+      rhs_type = self._checkExpr(type_ctx, pc, prog.rhs)
+
+      assert(isinstance(var_type, RefType) and isinstance(rhs_type, RefType))
+      assert(var_type.cell_type == rhs_type.cell_type)
+
+      self.constr_alias(var_type.label, rhs_type.label)
+      return type_ctx, proc_ctx, pc
+
+    elif isinstance(prog, Write):
+      var_type = self._checkExpr(type_ctx, pc, prog.var)
+      rhs_type = self._checkExpr(type_ctx, pc, prog.rhs)
+
+      assert(isinstance(var_type, RefType))
+      assert(type(var_type.cell_type) == type(rhs_type))
+
+      self.constr_write(pc, var_type.label)
       return type_ctx, proc_ctx, pc
 
     elif isinstance(prog, Fork):
@@ -225,20 +288,38 @@ class TypeChecker:
       return cur_type_ctx, cur_proc_ctx, cur_pc
 
 
-def prog():
+# write-read race
+def prog1():
   return \
     Block([ \
-      Declare("x"), \
-      Declare("y"), \
+      Declare("x", NewRef(Literal(0))), \
+      Declare("y", NewRef(Literal(0))), \
       Fork("f", Block([ \
-        Assign("y", VarRead("x"))
+        Write(Read("y"), Deref(Read("x")))
       ])), \
-      Assign("x", Literal(1)), \
+      Write(Read("x"), Literal(1)), \
       Join("f"), \
-      Assign("x", Literal(2))
+      Write(Read("x"), Literal(2))
+    ])
+
+
+# write-write race because of aliasing
+def prog2():
+  return \
+    Block([ \
+      Declare("x", NewRef(Literal(0))), \
+      Declare("y", NewRef(Literal(0))), \
+      Assign(Read("y"), Read("x")),
+      Fork("f", Block([ \
+        Write(Read("y"), Literal(0))
+      ])), \
+      Write(Read("x"), Literal(1)), \
+      Join("f"), \
+      Write(Read("x"), Literal(2))
     ])
 
 def main():
   checker = TypeChecker()
-  print(checker.check(prog()))
+  print(checker.check(prog1()))
+  print(checker.check(prog2()))
 
