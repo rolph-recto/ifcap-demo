@@ -539,10 +539,28 @@ prog8 = \
     Assign(Read("y"), Read("x")),
     Fork("f", Block([])),
     Fork("q", Block([
-      Write(Read("x"), Literal(1))
+      Write(Read("y"), Literal(1))
     ])),
     Join("f"),
     Write(Read("x"), Literal(2)),
+    Join("q")
+  ])
+
+
+## write-write race, nested refs
+prog9 = \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("y", NewRef(NewRef(Literal(0)))),
+    Declare("z", NewRef(NewRef(Literal(0)))),
+    Assign(Deref(Read("y")), Read("x")),
+    Assign(Deref(Read("z")), Read("x")),
+    Fork("f", Block([])),
+    Fork("q", Block([
+      Write(Deref(Read("y")), Literal(1))
+    ])),
+    Join("f"),
+    Write(Deref(Read("z")), Literal(2)),
     Join("q")
   ])
 
@@ -563,4 +581,5 @@ def main():
   print_check(checker, prog6)
   print_check(checker, prog7)
   print_check(checker, prog8)
+  print_check(checker, prog9)
 
