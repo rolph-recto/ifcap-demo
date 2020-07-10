@@ -282,7 +282,7 @@ class TypeChecker:
 
   # ref r1 is aliased to ref r2
   # r1 <= r2
-  def constr_alias(self, r1, r2, prog):
+  def constr_subsume(self, r1, r2, prog):
     x = z3.Int("x")
     self.add_assert(z3.ForAll([x], z3.Implies(r2(x), r1(x))), prog)
 
@@ -417,6 +417,40 @@ class TypeChecker:
     elif isinstance(lval, Deref):
       return self.get_lval_var(lval.ref)
 
+  def can_subsume(self, t1, t2, prog):
+    if isinstance(t1, IntType) and isinstance(t2, IntType):
+      return True
+
+    elif isinstance(t1, RefType) and isinstance(t2, RefType):
+      if self.can_subsume(t1.cell_type, t2.cell_type, prog):
+        if t1.label is not t2.label:
+          self.constr_subsume(t1.label, t2.label, prog)
+
+        return True
+
+      else:
+        return False
+
+    elif isinstance(t1, ChanType) and isinstance(t2, ChanType):
+      if self.can_subsume(t1.cell_type, t2.cell_type, prog):
+        if t1.ref_label is not t2.ref_label:
+          self.constr_subsume(t1.ref_label, t2.ref_label, prog)
+
+        if t1.chan_label is not t2.chan_label:
+          # TODO: should this be backwards?
+          # intuition for why this should be right is that the channel region
+          # can be bigger than is labeled, but it would be unsafe if the
+          # channel region were *smaller* than is labeled
+          self.constr_subsume(t2.chan_label, t1.chan_label, prog)
+
+        return True
+
+      else:
+        return False
+
+    else:
+      return False
+
   def _check(self, type_ctx, proc_ctx, pc, prog):
     if isinstance(prog, Declare):
       init_type = self._checkExpr(type_ctx, pc, prog.init_val)
@@ -430,8 +464,6 @@ class TypeChecker:
 
       assert(isinstance(var_type, RefType) and isinstance(rhs_type, RefType))
       assert(var_type.cell_type == rhs_type.cell_type)
-
-      # self.constr_alias(rhs_type.label, var_type.label)
       lval_var = self.get_lval_var(prog.var)
       new_type = self.update_type(prog.var, type_ctx[lval_var], rhs_type)
       out_type_ctx = dict(type_ctx)
@@ -444,10 +476,13 @@ class TypeChecker:
       rhs_type = self._checkExpr(type_ctx, pc, prog.rhs)
 
       assert(isinstance(var_type, RefType))
-      assert(type(var_type.cell_type) == type(rhs_type))
+      if self.can_subsume(var_type.cell_type, rhs_type, prog):
+        self.constr_write(pc, var_type.label, prog)
+        return type_ctx, proc_ctx, pc
 
-      self.constr_write(pc, var_type.label, prog)
-      return type_ctx, proc_ctx, pc
+      else:
+        raise Exception("cannot subsume type " + str(var_type.cell_type) + \
+            " to " + str(rhs_type))
 
     elif isinstance(prog, Fork):
       spawn_pc = self.new_pc()
@@ -466,29 +501,39 @@ class TypeChecker:
 
     elif isinstance(prog, Join):
       if prog.handle not in proc_ctx:
-        raise ("no existing process handle: " + prog.handle)
+        raise Exception("no existing process handle: " + prog.handle)
 
       spawn_type_ctx, spawn_pc = proc_ctx[prog.handle]
+
+      out_proc_ctx = dict()
+      for handle, proc_ctx_pc in proc_ctx.items():
+        if handle != prog.handle:
+          out_proc_ctx[handle] = proc_ctx_pc
 
       out_pc = self.new_pc()
       self.constr_join(spawn_pc, pc, out_pc, prog)
 
-      return type_ctx, proc_ctx, out_pc
+      return type_ctx, out_proc_ctx, out_pc
 
     elif isinstance(prog, Send):
       msg_type = self._checkExpr(type_ctx, pc, prog.msg)
       chan_type = self._checkExpr(type_ctx, pc, prog.chan)
 
-      ## TODO: fix, need to add constraints for subsumption
-      assert(type(msg_type) == type(chan_type.cell_type))
+      if self.can_subsume(chan_type.cell_type, msg_type, prog):
+        out_pc = self.new_pc()
+        self.constr_send(pc, chan_type.chan_label, out_pc, prog)
 
-      out_pc = self.new_pc()
-      self.constr_send(pc, chan_type.chan_label, out_pc, prog)
+        return type_ctx, proc_ctx, out_pc
 
-      return type_ctx, proc_ctx, out_pc
+      else:
+        raise Exception("cannot subsume type " + str(chan_type.cell_type) + \
+            " to " + str(msg_type))
 
     elif isinstance(prog, Receive):
       chan_type = self._checkExpr(type_ctx, pc, prog.chan)
+
+      # need write cap on receive to prevent recv contention
+      self.constr_write(pc, chan_type.ref_label, prog)
 
       out_type_ctx = dict(type_ctx)
       out_type_ctx[prog.var] = chan_type.cell_type
@@ -842,7 +887,7 @@ prog13 = \
   Block([
     Declare("x", NewRef(Literal(0))),
     Declare("c", NewChan(Literal(0))),
-    Fork("f", Block([
+    Fork("p", Block([
       Write(Read("x"), Literal(1)),
       Send(Literal(0), Read("c"))
     ])),
@@ -850,7 +895,84 @@ prog13 = \
       Receive("v", Read("c")),
       Write(Read("x"), Literal(2))
     ])),
-    Join("f"),
+    Join("p"),
+    Join("q")
+  ])
+
+## has race (recv contention)
+prog14 = \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("c", NewChan(Literal(0))),
+    Fork("p", Block([
+      Write(Read("x"), Literal(1)),
+      Send(Literal(0), Read("c"))
+    ])),
+    Fork("q", Block([
+      Receive("v", Read("c")),
+      Write(Read("x"), Literal(2))
+    ])),
+    Fork("r", Block([
+      Receive("v", Read("c")),
+      Write(Read("x"), Literal(2))
+    ])),
+    Join("p"),
+    Join("q"),
+    Join("r")
+  ])
+
+
+## has race (alias through nested refs)
+prog15 = \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("y", NewRef(NewRef(Literal(0)))),
+    Write(Read("y"), Read("x")),
+    Fork("p", Block([
+      Write(Deref(Read("y")), Literal(1))
+    ])),
+    Write(Read("x"), Literal(2)),
+    Join("p")
+  ])
+
+## no race (pass ref into a channel, pass channel into a channel)
+prog16 = \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("c", NewChan(NewChan(NewRef(Literal(0))))),
+    Fork("p", Block([
+      Receive("c2", Read("c")),
+      Receive("y", Read("c2")),
+      Write(Read("y"), Literal(1))
+    ])),
+    Fork("q", Block([
+      Write(Read("x"), Literal(2)),
+      Declare("c2", NewChan(NewRef(Literal(0)))),
+      Send(Read("c2"), Read("c")),
+      Send(Read("x"), Read("c2"))
+    ])),
+    Join("p"),
+    Join("q")
+  ])
+
+
+## write-write race (pass ref into a channel, pass channel into a channel)
+prog17 = \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("c", NewChan(NewChan(NewRef(Literal(0))))),
+    Fork("p", Block([
+      Receive("c2", Read("c")),
+      Receive("y", Read("c2")),
+      Write(Read("y"), Literal(1))
+    ])),
+    Fork("q", Block([
+      Declare("c2", NewChan(NewRef(Literal(0)))),
+      Send(Read("c2"), Read("c")),
+      Send(Read("x"), Read("c2")),
+      Write(Read("x"), Literal(2))
+    ])),
+    Join("p"),
     Join("q")
   ])
 
@@ -871,4 +993,8 @@ def main():
   print_check(checker, "prog11", prog11, False)
   print_check(checker, "prog12", prog12, True)
   print_check(checker, "prog13", prog13, True)
+  print_check(checker, "prog14", prog14, False)
+  print_check(checker, "prog15", prog15, False)
+  print_check(checker, "prog16", prog16, True)
+  print_check(checker, "prog17", prog17, False)
 
