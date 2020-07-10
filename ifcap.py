@@ -47,6 +47,22 @@ class Join:
   def __str__(self):
     return "join " + self.handle
 
+class Send:
+  def __init__(self, msg, chan):
+    self.msg = msg
+    self.chan = chan
+
+  def __str__(self):
+    return "send " + str(self.msg) + " to " + str(self.chan)
+
+class Receive:
+  def __init__(self, var, chan):
+    self.var = var
+    self.chan = chan
+
+  def __str__(self):
+    return str(self.var) + " <- recv from " + str(self.chan)
+
 class Cond:
   def __init__(self, guard, thenBranch, elseBranch):
     self.guard = guard
@@ -105,6 +121,13 @@ class NewRef:
   def __str__(self):
     return "newref(" + str(self.val) + ")"
 
+class NewChan:
+  def __init__(self, val):
+    self.val = val
+
+  def __str__(self):
+    return "newchan()"
+
 class Deref:
   def __init__(self, ref):
     self.ref = ref
@@ -141,6 +164,21 @@ class RefType:
   def __repr__(self):
     return self.__str__()
 
+class ChanType:
+  def __init__(self, cell_type, ref_label, chan_label):
+    self.cell_type = cell_type
+    self.ref_label = ref_label
+    self.chan_label = chan_label
+
+  def __eq__(self, other):
+    return isinstance(other, ChanType) and self.cell_type == other.cell_type
+
+  def __str__(self):
+    return "(" + str(self.cell_type) + ") chan"
+
+  def __repr__(self):
+    return self.__str__()
+
 
 ## Solver
 
@@ -152,6 +190,7 @@ class TypeChecker:
   def reset(self):
     self.pc_count = 1
     self.ref_count = 1
+    self.chan_count = 1
     self.assert_count = 1
     self.assert_map = dict()
     self.program_map = dict()
@@ -164,6 +203,12 @@ class TypeChecker:
     label = self.new_label(("ref" + str(self.ref_count)))
     self.constr_nonempty(label, prog)
     self.ref_count += 1
+    return label
+
+  def new_chan_label(self, prog):
+    label = self.new_label(("chan" + str(self.chan_count)))
+    self.constr_nonempty(label, prog)
+    self.chan_count += 1
     return label
 
   def new_pc(self):
@@ -221,6 +266,20 @@ class TypeChecker:
     x = z3.Int("x")
     self.add_assert(z3.ForAll([x], z3.Not(z3.And(r1(x), r2(x)))), prog)
 
+  # subtract some of the sending process region to the channel region
+  def constr_send(self, pc1, c, pc2, prog):
+    x = z3.Int("x")
+    self.add_assert( \
+        z3.ForAll([x], z3.Implies(pc2(x), z3.And(pc1(x), z3.Not(c(x))))), \
+        prog)
+
+  # add the channel region and the process region together
+  def constr_recv(self, pc1, c, pc2, prog):
+    x = z3.Int("x")
+    self.add_assert( \
+        z3.ForAll([x], z3.Implies(pc2(x), z3.Or(pc1(x), c(x)))), \
+        prog)
+
   # ref r1 is aliased to ref r2
   # r1 <= r2
   def constr_alias(self, r1, r2, prog):
@@ -263,6 +322,33 @@ class TypeChecker:
       else:
         return t1
 
+    elif isinstance(t1, ChanType) and isinstance(t2, ChanType):
+      if t1.ref_label is not t2.ref_label or t1.chan_label is not t2.chan_label:
+        unified_cell_type = self.unify_types(t1.cell_type, t2.cell_type, prog)
+
+        unified_ref_label = None
+        if t1.ref_label is not t2.ref_label:
+          unified_ref_label = self.new_ref_label(prog)
+          self.constr_control_join(t1.ref_label, t2.ref_label, \
+              unified_ref_label, prog)
+
+        else:
+          unified_ref_label = t1.ref_label
+
+        unified_chan_label = None
+        if t1.chan_label is not t2.chan_label:
+          unified_chan_label = self.new_chan_label(prog)
+          self.constr_control_join(t1.chan_label, t2.chan_label, \
+              unified_ref_label, prog)
+
+        else:
+          unified_chan_label = t1.chan_label
+
+        return ChanType(unified_cell_type, unified_ref_label, unified_chan_label)
+
+      else:
+        return t1
+
     else:
       raise Exception("cannot unify types: " + str(t1) + " and " + str(t2))
 
@@ -290,6 +376,12 @@ class TypeChecker:
       cell_type = self._checkExpr(type_ctx, pc, expr.val)
       label = self.new_ref_label(expr)
       return RefType(cell_type, label)
+
+    elif isinstance(expr, NewChan):
+      cell_type = self._checkExpr(type_ctx, pc, expr.val)
+      ref_label = self.new_ref_label(expr)
+      chan_label = self.new_chan_label(expr)
+      return ChanType(cell_type, ref_label, chan_label)
 
     elif isinstance(expr, Deref):
       ref_type = self._checkExpr(type_ctx, pc, expr.ref)
@@ -383,6 +475,29 @@ class TypeChecker:
 
       return type_ctx, proc_ctx, out_pc
 
+    elif isinstance(prog, Send):
+      msg_type = self._checkExpr(type_ctx, pc, prog.msg)
+      chan_type = self._checkExpr(type_ctx, pc, prog.chan)
+
+      ## TODO: fix, need to add constraints for subsumption
+      assert(type(msg_type) == type(chan_type.cell_type))
+
+      out_pc = self.new_pc()
+      self.constr_send(pc, chan_type.chan_label, out_pc, prog)
+
+      return type_ctx, proc_ctx, out_pc
+
+    elif isinstance(prog, Receive):
+      chan_type = self._checkExpr(type_ctx, pc, prog.chan)
+
+      out_type_ctx = dict(type_ctx)
+      out_type_ctx[prog.var] = chan_type.cell_type
+
+      out_pc = self.new_pc()
+      self.constr_join(pc, chan_type.chan_label, out_pc, prog)
+
+      return out_type_ctx, proc_ctx, out_pc
+
     elif isinstance(prog, Cond):
       self._checkExpr(type_ctx, pc, prog.guard)
 
@@ -440,6 +555,9 @@ def print_expr(expr):
   elif isinstance(expr, NewRef):
     return "newref(" + print_expr(expr.val) + ")"
 
+  elif isinstance(expr, NewChan):
+    return "newchan()"
+
   elif isinstance(expr, Deref):
     return "!" + print_expr(expr.ref)
 
@@ -461,6 +579,12 @@ def print_stmt(prog, indent_level=0):
 
   elif isinstance(prog, Join):
     return indent + "join " + prog.handle
+
+  elif isinstance(prog, Send):
+    return indent + "send " + print_expr(prog.msg) + " to " + print_expr(prog.chan)
+
+  elif isinstance(prog, Receive):
+    return indent + prog.var + " <- recv from " + print_expr(prog.chan)
 
   elif isinstance(prog, Cond):
     return indent + "if (" + print_expr(prog.guard) + ") {\n" + \
@@ -713,6 +837,23 @@ def print_check(checker, name, prog, has_races):
     print("test " + name + " passed!")
 
 
+## no races, transfer cap for x using a channel
+prog13 = \
+  Block([
+    Declare("x", NewRef(Literal(0))),
+    Declare("c", NewChan(Literal(0))),
+    Fork("f", Block([
+      Write(Read("x"), Literal(1)),
+      Send(Literal(0), Read("c"))
+    ])),
+    Fork("q", Block([
+      Receive("v", Read("c")),
+      Write(Read("x"), Literal(2))
+    ])),
+    Join("f"),
+    Join("q")
+  ])
+
 
 def main():
   checker = TypeChecker()
@@ -729,4 +870,5 @@ def main():
   print_check(checker, "prog10", prog10, False)
   print_check(checker, "prog11", prog11, False)
   print_check(checker, "prog12", prog12, True)
+  print_check(checker, "prog13", prog13, True)
 
