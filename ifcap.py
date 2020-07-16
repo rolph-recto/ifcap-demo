@@ -207,7 +207,6 @@ class TypeChecker:
 
   def new_chan_label(self, prog):
     label = self.new_label(("chan" + str(self.chan_count)))
-    self.constr_nonempty(label, prog)
     self.chan_count += 1
     return label
 
@@ -265,20 +264,6 @@ class TypeChecker:
   def constr_disjoint(self, r1, r2, prog):
     x = z3.Int("x")
     self.add_assert(z3.ForAll([x], z3.Not(z3.And(r1(x), r2(x)))), prog)
-
-  # subtract some of the sending process region to the channel region
-  def constr_send(self, pc1, c, pc2, prog):
-    x = z3.Int("x")
-    self.add_assert( \
-        z3.ForAll([x], z3.Implies(pc2(x), z3.And(pc1(x), z3.Not(c(x))))), \
-        prog)
-
-  # add the channel region and the process region together
-  def constr_recv(self, pc1, c, pc2, prog):
-    x = z3.Int("x")
-    self.add_assert( \
-        z3.ForAll([x], z3.Implies(pc2(x), z3.Or(pc1(x), c(x)))), \
-        prog)
 
   # ref r1 is aliased to ref r2
   # r1 <= r2
@@ -424,7 +409,7 @@ class TypeChecker:
     elif isinstance(t1, RefType) and isinstance(t2, RefType):
       if self.can_subsume(t1.cell_type, t2.cell_type, prog):
         if t1.label is not t2.label:
-          self.constr_subsume(t1.label, t2.label, prog)
+          self.constr_subsume(t2.label, t1.label, prog)
 
         return True
 
@@ -434,7 +419,7 @@ class TypeChecker:
     elif isinstance(t1, ChanType) and isinstance(t2, ChanType):
       if self.can_subsume(t1.cell_type, t2.cell_type, prog):
         if t1.ref_label is not t2.ref_label:
-          self.constr_subsume(t1.ref_label, t2.ref_label, prog)
+          self.constr_subsume(t2.ref_label, t1.ref_label, prog)
 
         if t1.chan_label is not t2.chan_label:
           # TODO: should this be backwards?
@@ -521,7 +506,13 @@ class TypeChecker:
 
       if self.can_subsume(chan_type.cell_type, msg_type, prog):
         out_pc = self.new_pc()
-        self.constr_send(pc, chan_type.chan_label, out_pc, prog)
+
+        # can only give away capability that the pc currently has
+        self.constr_write(pc, chan_type.chan_label, prog)
+
+        # give away capability and store it in the channel label
+        self.constr_fork(pc, chan_type.chan_label, out_pc, prog)
+        self.constr_disjoint(chan_type.chan_label, out_pc, prog)
 
         return type_ctx, proc_ctx, out_pc
 
