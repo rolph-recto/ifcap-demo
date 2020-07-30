@@ -207,6 +207,7 @@ class TypeChecker:
 
   def new_chan_label(self, prog):
     label = self.new_label(("chan" + str(self.chan_count)))
+    self.constr_nonempty(label, prog)
     self.chan_count += 1
     return label
 
@@ -967,6 +968,51 @@ prog17 = \
     Join("q")
   ])
 
+prog18 = \
+  Block([
+    Declare("c", NewChan(NewChan(Literal(0)))),
+    Declare("c1", NewChan(Literal(0))),
+    Declare("c2", NewChan(Literal(0))),
+    Fork("p", Block([
+      Send(Read("c1"), Read("c")),
+      Send(Literal(0), Read("c1")),
+    ])),
+    Fork("q", Block([
+      Send(Read("c2"), Read("c")),
+      Send(Literal(1), Read("c2")),
+    ])),
+    Receive("c'", Read("c")),
+    Receive("x", Read("c'")),
+    Receive("y", Read("c'")),
+  ])
+
+prog19 = \
+  Block([
+    Declare("c", NewChan(Literal(0))),
+    Fork("p", Block([
+      Send(Literal(0), Read("c")),
+    ])),
+    Fork("q", Block([
+      Send(Literal(1), Read("c")),
+    ])),
+    Receive("x", Read("c")),
+  ])
+
+prog20 = \
+  Block([
+    Declare("rc", NewRef(NewChan(Literal(0)))),
+    Declare("c1", NewChan(Literal(0))),
+    Declare("c2", NewChan(Literal(0))),
+    Cond(Literal(0),
+      Write(Read("rc"), Read("c1")),
+      Write(Read("rc"), Read("c2")),
+    ),
+    Fork("p", Block([
+      Send(Literal(0), Deref(Read("rc")))
+    ])),
+    Send(Literal(1), Read("c1"))
+  ])
+
 
 def main():
   checker = TypeChecker()
@@ -988,4 +1034,7 @@ def main():
   print_check(checker, "prog15", prog15, False)
   print_check(checker, "prog16", prog16, True)
   print_check(checker, "prog17", prog17, False)
+  print_check(checker, "prog18", prog18, False)
+  print_check(checker, "prog19", prog19, False)
+  print_check(checker, "prog20", prog20, False)
 
