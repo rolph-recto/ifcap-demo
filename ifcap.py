@@ -410,7 +410,11 @@ class TypeChecker:
     elif isinstance(t1, RefType) and isinstance(t2, RefType):
       if self.can_subsume(t1.cell_type, t2.cell_type, prog):
         if t1.label is not t2.label:
+          # covariance
           self.constr_subsume(t2.label, t1.label, prog)
+
+          # contravariance
+          self.constr_subsume(t1.label, t2.label, prog)
 
         return True
 
@@ -1013,6 +1017,52 @@ prog20 = \
     Send(Literal(1), Read("c1"))
   ])
 
+prog21 = \
+  Block([
+    Declare("r", NewRef(NewRef(Literal(0)))),
+    Declare("r1", NewRef(Literal(1))),
+    Declare("r2", NewRef(Literal(2))),
+    Cond(Literal(0),
+      Write(Read("r"), Read("r1")),
+      Write(Read("r"), Read("r2")),
+    ),
+    Fork("p", Block([
+      Write(Deref(Read("r")), Literal(0)),
+    ])),
+    Write(Read("r1"), Literal(1)),
+  ])
+
+# counterexample for ref covariance
+prog22 = \
+  Block([
+    Declare("r", NewRef(NewRef(Literal(0)))),
+    Declare("r1", NewRef(Literal(1))),
+    Declare("r2", NewRef(Literal(2))),
+    Cond(Literal(0),
+      Write(Read("r"), Read("r1")),
+      Write(Read("r"), Read("r2")),
+    ),
+    Fork("p", Block([
+      Write(Deref(Read("r")), Literal(3)),
+    ])),
+    Declare("x", Deref(Read("r1")))
+  ])
+
+# counterexample for ref contravariance
+prog23 = \
+  Block([
+    Declare("r", NewRef(NewRef(Literal(0)))),
+    Declare("r1", NewRef(Literal(1))),
+    Declare("r2", NewRef(Literal(2))),
+    Cond(Literal(0),
+      Write(Read("r"), Read("r1")),
+      Write(Read("r"), Read("r2")),
+    ),
+    Fork("p", Block([
+      Declare("x", Deref(Deref(Read("r"))))
+    ])),
+    Write(Read("r1"), Literal(4))
+  ])
 
 def main():
   checker = TypeChecker()
@@ -1037,4 +1087,7 @@ def main():
   print_check(checker, "prog18", prog18, False)
   print_check(checker, "prog19", prog19, False)
   print_check(checker, "prog20", prog20, False)
+  print_check(checker, "prog21", prog21, False)
+  print_check(checker, "prog22", prog22, False)
+  print_check(checker, "prog23", prog23, False)
 
